@@ -1,7 +1,9 @@
 // Lueftung02 - Garage ventilation control with Atmega328
-// Powered by 15V Wallwart, uC and sensors running at 3.3V via RECOM R-785.0-1-0 and MCP1825S,
-// using SHT21 and DS18B20 sensors, and an IRLI540N to switch two fans for intake and exhaust.
-// (C) Copyright 2014 Sebastian Wangnick.
+// Powered by 15V Wallwart, uC and sensors running at 3.3V 
+// (via DSN-MINI-360 buck module from Aliexpress)
+// using SHT21, DS18B20, a capacitive humidity sensor of own construction, 
+// and an IRLI540N to switch two fans for intake and exhaust.
+// (C) Copyright 2014 Sebastian Wangnick. All rights reserved.
 // See http://s.wangnick.de/doku.php for design details.
 
 // Layout
@@ -9,7 +11,7 @@
 //                    DTR - 680n - !RESET  1|o   |28  PC5 (A5,D19) SCL - SHT common SCL (passed on via SCLEN) - BC547C#1,2,3 Emitter
 //                     TXD - RXD (D0) PD0  2|    |27  PC4 (A4,D18) SDA - SHT common SDA, 1k0 - SENS VCC
 //                     RXD - TXD (D1) PD1  3|    |26  PC3 (A3,D17) - 100k - BC547C#1 Basis - Collector - SHT#1 Zuluft, 1k0 - SENS VCC
-//                               (D2) PD2  4|    |25  PC2 (A2,D16) - 100k - BC547C#2 Basis - Collector - SHT#2 Hangwand, 1k0 - SENS VCC 
+//                               (D2) PD2  4|    |25  PC2 (A2,D16) - 100k - BC547C#2 Basis - Collector - SHT#2 Hangwand, wallhumislave, 1k0 - SENS VCC 
 // SENS VCC - 1k5 - DS18B20 DQ - (D3) PD3  5|    |24  PC1 (A1,D15) - 100k - BC547C#3 Basis - Collector - SHT#3 Abluft, 1k0 - SENS VCC 
 //           SENS VCC via wire ! (D4) PD4  6|    |23  PC0 (A0,D14) - SENS VCC (auch fuer SHT21)
 //                     MCP VOUT 3V3 - VCC  7|    |22  GND
@@ -41,6 +43,7 @@
 #include <avr/pgmspace.h>
 
 #define INVALDECI ((int16_t)0x8000)
+#define INVALUINT ((uint16_t)0xFFFF)
 #define SENSORVCC_PIN 14
 #define CYCLE 5
 
@@ -71,7 +74,6 @@ CompDsData compDsData[DSN];
 #include <Wire.h>
 enum {SHT21_ADDR=0x40};
 enum {SHT21_TEMPHOLD=0xE3, SHT21_HUMIHOLD=0xE5, SHT21_TEMPPOLL=0xF3, SHT21_HUMIPOLL=0xF5};
-
 enum {AUSSEN, BODENV, BODENH, SHTN};
 const char shtname0[] PROGMEM = "Zuluft";
 const char shtname1[] PROGMEM = "Wand H";
@@ -82,6 +84,18 @@ typedef struct {
 } CompShtData;
 CompShtData compShtData[SHTN];
 
+enum {CAPHUM_ADDR=0x1C};
+enum {CAPHUM_RESET=0x00};
+enum {CAPHUMN = 1};
+#define CAPHUM_MIN 10000
+#define CAPHUM_MAX 40000
+const uint8_t caphumpin[CAPHUMN] PROGMEM = {16};
+const char caphumname0[] PROGMEM = "SteinH";
+typedef struct {
+  uint16_t period;
+} CompCaphumData;
+CompCaphumData compCaphumData[CAPHUMN];
+
 enum {FANN = 1};
 const uint8_t fanpin[FANN] PROGMEM = {9};
 const char fanname0[] PROGMEM = "Lufter";
@@ -91,12 +105,12 @@ typedef struct {
 } CompFanData;
 CompFanData compFanData[FANN];
 
-typedef enum {COMP_DS,COMP_SHT,COMP_FAN,COMPTYPES} ComponentType;
+typedef enum {COMP_DS,COMP_SHT,COMP_CAPHUM,COMP_FAN,COMPTYPES} ComponentType;
 typedef enum {SETUP, LOOP} ProcessorTask;
 typedef void (*ComponentTypeProcessor)(uint8_t comp, uint8_t task);
-ComponentTypeProcessor componentTypeProcessor[COMPTYPES] = {compDsProcessor, compShtProcessor, compFanProcessor};
+ComponentTypeProcessor componentTypeProcessor[COMPTYPES] = {compDsProcessor, compShtProcessor, compCaphumProcessor, compFanProcessor};
 
-enum {COMPONENTS = 7};   
+enum {COMPONENTS = 8};   
 typedef struct {
   const char* name_P;
   ComponentType type;
@@ -109,6 +123,7 @@ Component component[COMPONENTS] = {
    {dsname0, COMP_DS, 0},
    {dsname1, COMP_DS, 1},
    {dsname2, COMP_DS, 2},
+   {caphumname0, COMP_CAPHUM, 0},
    {fanname0, COMP_FAN, 0},
 };
 
@@ -169,14 +184,14 @@ int16_t dewp (int16_t relhumi, int16_t temp) {
     return temp-(int16_t)(dpd*10.0);
 }
 
-uint8_t sht_read8crc (uint8_t* val8, uint8_t sendstop) {
-    Wire.requestFrom((uint8_t)SHT21_ADDR,(uint8_t)2,sendstop);
+uint8_t i2c_read8crc (uint8_t addr, uint8_t* val8, uint8_t sendstop) {
+    Wire.requestFrom(addr,(uint8_t)2,sendstop);
     val8[0] = Wire.read();
     return crcu(0,val8[0])!=Wire.read();
 }
 
-uint8_t sht_read16crc (uint16_t* val16, uint8_t sendstop) {
-    Wire.requestFrom((uint8_t)SHT21_ADDR,(uint8_t)3,sendstop);
+uint8_t i2c_read16crc (uint8_t addr, uint16_t* val16, uint8_t sendstop) {
+    Wire.requestFrom(addr,(uint8_t)3,sendstop);
     uint8_t* val8 = (uint8_t*) val16;
     // AVR uses little endianness (lsb are first in storage, then msb)
     val8[1] = Wire.read();
@@ -197,6 +212,21 @@ char* printDeci (int16_t deci) {
     } else {
       if (len<=1+(deci<0)) {buffer[len]=buffer[len-1]; buffer[len-1]='0'; len++;} // len is now >=2 (>=3 for negative)
       buffer[len]=buffer[len-1]; buffer[len-1]='.'; len++; buffer[len]=0; // len is now 3-5 (4-5 for negative)
+      memmove(buffer+5-len,buffer,len);
+      memset(buffer,' ',5-len);
+    }
+  }
+  return buffer;
+}
+
+char* printUint (uint16_t uint) {
+  static char buffer[7];
+  if (uint==INVALUINT) {
+    strcpy_P(buffer,PSTR("ERROR"));
+  } else {
+    utoa(uint,buffer,10);
+    uint8_t len = strlen(buffer);
+    if (len<5) {
       memmove(buffer+5-len,buffer,len);
       memset(buffer,' ',5-len);
     }
@@ -244,7 +274,7 @@ void compShtProcessor (uint8_t comp, uint8_t task) {
     uint16_t uval;
     int16_t val;
     uint8_t err;
-    err = sht_read16crc(&uval,false);
+    err = i2c_read16crc(SHT21_ADDR,&uval,false);
     val = (int16_t)(-468.5 + 1757.2 / 65536.0 * (float)uval);
     compShtData[idx].temp = err||val<-600||val>999? INVALDECI: val; 
     char* txt = printDeci(compShtData[idx].temp);
@@ -259,7 +289,7 @@ void compShtProcessor (uint8_t comp, uint8_t task) {
     Wire.beginTransmission(SHT21_ADDR);
     Wire.write(SHT21_HUMIHOLD);
     Wire.endTransmission(false);
-    err = sht_read16crc(&uval,true);
+    err = i2c_read16crc(SHT21_ADDR,&uval,true);
     digitalWrite(pin,LOW);
     val = (int16_t)(-60.0 + 1250.0 / 65536.0 * (float)uval);
     compShtData[idx].humi = err||val<-200||val>1200? INVALDECI: val;
@@ -278,6 +308,34 @@ void compShtProcessor (uint8_t comp, uint8_t task) {
     txt = printDeci(compShtData[idx].dewp);
     Display.write(' ');
     Display.print(txt);
+  }
+}
+
+void compCaphumProcessor (uint8_t comp, uint8_t task) {
+  uint8_t idx = component[comp].idx;
+  uint8_t pin = pgm_read_byte(caphumpin+idx);
+  if (task==SETUP) {
+    Display.print(F("#####"));
+    pinMode(pin,OUTPUT);
+  } else { // task==LOOP
+    digitalWrite(pin,HIGH);
+    Wire.beginTransmission(CAPHUM_ADDR);
+    Wire.write(CAPHUM_RESET);
+    Wire.endTransmission(false);
+    uint16_t uval;
+    uint8_t err;
+    err = i2c_read16crc(CAPHUM_ADDR,&uval,true);
+    digitalWrite(pin,LOW);
+    compCaphumData[idx].period = err||uval<CAPHUM_MIN||uval>CAPHUM_MAX? INVALUINT: uval;
+    char* txt = printUint(compCaphumData[idx].period);
+    Display.print(txt);
+    if (compCaphumData[idx].period!=INVALUINT) {
+      while (*txt==' ') txt++;
+      MySerial.print(F("&c"));
+      MySerial.print(comp);
+      MySerial.print(F("f="));
+      MySerial.print(txt);
+    }
   }
 }
 
@@ -306,11 +364,13 @@ void setup(void) {
   CLKPR = 0;
 
   Serial.begin(115200);
-  Serial.println(__FILE__ " " __DATE__ " " __TIME__);
+  Serial.println(F("setup(" __FILE__ ", " __DATE__ " " __TIME__ ")"));
   Display.initR(INITR_REDTAB);
   Display.setRotation(1);
   Display.fillScreen(BG);
   Display.setTextColor(FG,BG);
+  Display.setCursor(0,(ROWS-3)*FONTHEIGHT); Display.print(F("Source: ")); Display.print(F(__FILE__));
+  Display.setCursor(0,(ROWS-2)*FONTHEIGHT); Display.print(F("Date:   ")); Display.print(F(__DATE__ " " __TIME__));
   Display.setCursor(0,(ROWS-1)*FONTHEIGHT); Display.print(F("Uptime: "));
   pinMode(SENSORVCC_PIN,OUTPUT);
   Wire.begin();
